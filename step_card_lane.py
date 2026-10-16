@@ -153,18 +153,27 @@ class FeishuStepCardMixin:
             turn = self._step_turn_map().get(chat)
             if turn is None or turn.closed:
                 return
+            line = str(preview or "").strip()
             if event_type == "tool.started":
-                turn.blocks.append({
-                    "kind": "tools",
-                    "title": f"🔧 {tool_name or '工具'}",
-                    "lines": [str(preview or "").strip()] if preview else [],
-                })
+                # Merge consecutive tool calls into one block (no thinking in between).
+                if turn.blocks and turn.blocks[-1].get("kind") == "tools":
+                    if line:
+                        turn.blocks[-1]["lines"].append(line)
+                else:
+                    turn.blocks.append({
+                        "kind": "tools",
+                        "lines": [line] if line else [],
+                    })
             elif event_type == "reasoning.available":
-                turn.blocks.append({
-                    "kind": "notes",
-                    "title": "💭 思考",
-                    "lines": [str(preview or "").strip()] if preview else [],
-                })
+                # Merge consecutive thinking notes into one block.
+                if turn.blocks and turn.blocks[-1].get("kind") == "notes":
+                    if line:
+                        turn.blocks[-1]["lines"].append(line)
+                else:
+                    turn.blocks.append({
+                        "kind": "notes",
+                        "lines": [line] if line else [],
+                    })
             self._step_render_locked(turn)
 
     def _step_render_locked(self, turn: _StepTurn) -> None:
