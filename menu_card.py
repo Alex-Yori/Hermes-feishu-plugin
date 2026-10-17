@@ -87,9 +87,12 @@ MENU_SELECT_MAX_OPTIONS = 6
 #: reach a desktop conversation started a few turns ago.
 MENU_SESSION_LIMIT = 10
 
-#: The user's own provider catalogues run large (dozens of ``cn:*`` models), so the
-#: picker takes a generous slice and ``/model`` remains the complete list.
+#: The picker offers the models this account actually runs; this caps how many
+#: distinct ones are scanned back through session history to find them.
 MENU_MODEL_LIMIT = 12
+
+#: How many recent sessions to scan when collecting the models in use.
+MENU_MODEL_HISTORY_SCAN = 500
 
 #: Badges for sessions that did not originate in this chat, so a desktop session is
 #: recognisable before it is picked.
@@ -188,6 +191,21 @@ def _split_select_value(raw: str, name: str) -> tuple[str, str]:
         if tag in MENU_SELECTS:
             return tag, rest
     return name, raw
+
+
+def _is_local_model_path(model_id: str) -> bool:
+    """Whether this "model" is a local llama.cpp / LM Studio file, not a provider model.
+
+    Session records name them by path. Offering one in a ``/model`` dropdown would
+    either fail or, worse, look like it worked and silently point the chat at a
+    file the chat is not running.
+    """
+    text = str(model_id or "").strip()
+    if not text:
+        return True
+    if text.startswith("/") or text.startswith("~"):
+        return True
+    return text.lower().endswith((".gguf", ".safetensors", ".bin", ".pt"))
 
 
 def _plain_text(content: str) -> dict[str, Any]:
@@ -416,45 +434,102 @@ class FeishuMenuMixin:
             options.append({"label": label[:40], "value": value})
         return options
 
-    @staticmethod
-    def _menu_model_options() -> list[dict[str, str]]:
-        """The models configured under ``providers.<name>.models``.
+    async def _menu_model_options(self) -> list[dict[str, str]]:
+        """The models this account actually uses, most recent first.
 
-        This is the user's own catalogue (what the desktop picker lists), not the
-        provider-agnostic curated list — showing models an account cannot reach
-        just produces picks that fail. The active provider leads.
+        Not a provider catalogue: a configured provider can carry dozens of
+        models the account has never run (``cn:hy3-c``, ``cn:hy4-preview-ctrl``
+        and 70-odd siblings), and a picker full of them is a list of guesses
+        rather than the handful of choices that ever get picked.
+
+        Usage is read from the session records' own ``model`` column — the same
+        listing the session picker already queries — so the list maintains
+        itself as conversations run, with no config to keep in sync.
+
+        There is deliberately no fallback to the configured provider catalogues:
+        that list is the thing being escaped. With nothing on record the card
+        drops the dropdown for its ``/model`` button instead.
         """
+        return await self._menu_used_model_options()
+
+    async def _menu_used_model_options(self) -> list[dict[str, str]]:
+        """Distinct models recorded on recent sessions, newest session first."""
+        db = self._menu_session_db()
+        if db is None or not hasattr(db, "list_sessions_rich"):
+            return self._menu_model_options_for(self._menu_current_model())
+        try:
+            rows = await asyncio.to_thread(db.list_sessions_rich, limit=MENU_MODEL_HISTORY_SCAN)
+        except Exception as exc:
+            logger.info(
+                "[Feishu] menu: model history unavailable (%s: %s)", type(exc).__name__, exc,
+            )
+            # A DB blip should cost the history, not the whole picker: the model
+            # already in use is still a valid choice.
+            return self._menu_model_options_for(self._menu_current_model())
+        rows = list(rows) if isinstance(rows, (list, tuple)) else []
+        # last_active desc, so the model just used is the first row offered.
+        ordered = sorted(
+            (row for row in rows if isinstance(row, dict)),
+            key=lambda row: float(row.get("last_active") or row.get("last_activity_at") or 0.0),
+            reverse=True,
+        )
+        seen: set[str] = set()
+        recent: list[str] = []
+        for row in ordered:
+            model_id = str(row.get("model") or "").strip()
+            if not model_id or model_id in seen or _is_local_model_path(model_id):
+                continue
+            seen.add(model_id)
+            recent.append(model_id)
+        # The active model leads even if no session has recorded it yet.
+        current = self._menu_current_model()
+        return self._menu_model_options_for(
+            current, [m for m in recent if m != current],
+        )
+
+    def _menu_model_options_for(
+        self, current: str, others: list[str] | None = None,
+    ) -> list[dict[str, str]]:
+        """Label the given models, current one first, capped."""
+        model_ids = ([current] if current else []) + list(others or [])
+        return [
+            {"label": self._menu_model_label(model)[:40], "value": model}
+            for model in model_ids[:MENU_MODEL_LIMIT]
+        ]
+
+    def _menu_session_db(self) -> Any:
+        store = getattr(self, "_session_store", None)
+        db = getattr(store, "_db", None) or store
+        return db if hasattr(db, "list_sessions_rich") else None
+
+    @staticmethod
+    def _menu_current_model() -> str:
         try:
             from hermes_cli.config import load_config_readonly
 
             config = load_config_readonly() or {}
-        except Exception as exc:
-            logger.info("[Feishu] menu: model list unavailable (%s: %s)", type(exc).__name__, exc)
-            return []
-        providers = config.get("providers")
-        if not isinstance(providers, dict):
-            return []
-        active_provider = str((config.get("model") or {}).get("provider") or "")
-        options: list[dict[str, str]] = []
-        ordered = sorted(
-            ((name, cfg) for name, cfg in providers.items() if isinstance(cfg, dict)),
-            key=lambda item: item[0] != active_provider,
-        )
-        for name, provider in ordered:
-            models = provider.get("models")
-            model_ids = list(models.keys()) if isinstance(models, dict) else []
-            default = provider.get("model")
-            if isinstance(default, str) and default and default not in model_ids:
-                model_ids.insert(0, default)
-            if not model_ids:
+        except Exception:
+            return ""
+        return str((config.get("model") or {}).get("default") or "").strip()
+
+    @staticmethod
+    def _menu_model_label(model_id: str) -> str:
+        """Prefix a model with the provider that serves it, when it is configured."""
+        try:
+            from hermes_cli.config import load_config_readonly
+
+            providers = (load_config_readonly() or {}).get("providers") or {}
+        except Exception:
+            providers = {}
+        for slug, provider in providers.items():
+            if not isinstance(provider, dict):
                 continue
-            label_prefix = str(provider.get("name") or name)
-            for model_id in model_ids:
-                text = str(model_id)
-                options.append({"label": f"{label_prefix} · {text}"[:40], "value": text})
-                if len(options) >= MENU_MODEL_LIMIT:
-                    return options
-        return options
+            configured = provider.get("models")
+            if (isinstance(configured, dict) and model_id in configured) or (
+                provider.get("model") == model_id
+            ):
+                return f"{provider.get('name') or slug} · {model_id}"
+        return model_id
 
     async def _build_menu_card(
         self, chat_id: str, *, note: str = "", user_id: str = "", chat_type: str = "dm",
@@ -462,7 +537,7 @@ class FeishuMenuMixin:
         return build_menu_card(
             note=note,
             sessions=await self._menu_session_options(chat_id, user_id=user_id, chat_type=chat_type),
-            models=self._menu_model_options(),
+            models=await self._menu_model_options(),
         )
 
     # --- serving ---
