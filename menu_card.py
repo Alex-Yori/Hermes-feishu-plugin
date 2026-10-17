@@ -87,9 +87,10 @@ MENU_SELECT_MAX_OPTIONS = 6
 #: reach a desktop conversation started a few turns ago.
 MENU_SESSION_LIMIT = 10
 
-#: The picker offers the models this account actually runs; this caps how many
-#: distinct ones are scanned back through session history to find them.
-MENU_MODEL_LIMIT = 12
+#: The picker offers the models this account actually runs, newest first. Three
+#: is the working set: beyond that the dropdown stops being a shortlist and
+#: starts being the catalogue again. Raise it if you rotate through more.
+MENU_MODEL_LIMIT = 3
 
 #: How many recent sessions to scan when collecting the models in use.
 MENU_MODEL_HISTORY_SCAN = 500
