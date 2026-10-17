@@ -281,17 +281,17 @@ def build_menu_card(
     """
     elements: list[dict[str, Any]] = []
 
-    # Each picker carries its own ceiling: the providers above already trimmed
-    # to MENU_SESSION_LIMIT / MENU_MODEL_LIMIT, and re-slicing everything to the
-    # shared MAX would quietly cut both lists down to the smallest of them.
-    session_options = (sessions or [])[:MENU_SESSION_LIMIT]
+    # Each picker carries its own ceiling, already applied by the provider that
+    # built it. Re-slicing here would silently drop entries the picker chose to
+    # include (a pinned model rides above the usage cap).
+    session_options = sessions or []
     if session_options:
         elements.append(_select("menu_session", "切换会话", session_options))
     else:
         elements.append(_icon_label("💬", "暂无其他会话"))
     elements.append(_button_row(_menu_button("new", "🆕 新会话", primary=True)))
 
-    model_options = (models or [])[:MENU_MODEL_LIMIT]
+    model_options = models or []
     if model_options:
         elements.append(_select("menu_model", "切换模型", model_options))
     else:
