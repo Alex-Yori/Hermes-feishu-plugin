@@ -484,18 +484,40 @@ class FeishuMenuMixin:
             recent.append(model_id)
         # The active model leads even if no session has recorded it yet.
         current = self._menu_current_model()
-        return self._menu_model_options_for(
-            current, [m for m in recent if m != current],
-        )
+        # Pinned models ride alongside and are NOT counted against the usage cap:
+        # asking for a model by name is a statement of intent that the recency
+        # ranking should not be able to squeeze out.
+        pinned = [m for m in self._menu_pinned_models() if m != current]
+        recent = [m for m in recent if m != current and m not in pinned]
+        # The shortlist size the user asked for, plus whatever they pinned on
+        # top: pinning is additive, not a trade against a model that earned its
+        # place by being used.
+        cap = MENU_MODEL_LIMIT + len(pinned)
+        return self._menu_model_options_for(current, pinned + recent, cap=cap)
+
+    def _menu_pinned_models(self) -> list[str]:
+        """Models the user asked to keep in the picker, from ``menu_models``.
+
+        The usage-derived list only knows a model after a conversation has run
+        on it, which is no use for a model you want to switch TO. Listing them
+        in the platform config puts one there without waiting for a session.
+        """
+        raw = getattr(getattr(self, "config", None), "extra", None)
+        pinned = (raw or {}).get("menu_models") if isinstance(raw, dict) else None
+        if isinstance(pinned, str):
+            pinned = [pinned]
+        if not isinstance(pinned, (list, tuple)):
+            return []
+        return [str(item).strip() for item in pinned if str(item).strip()]
 
     def _menu_model_options_for(
-        self, current: str, others: list[str] | None = None,
+        self, current: str, others: list[str] | None = None, *, cap: int = MENU_MODEL_LIMIT,
     ) -> list[dict[str, str]]:
-        """Label the given models, current one first, capped."""
+        """Label the given models, current one first, up to ``cap`` of them."""
         model_ids = ([current] if current else []) + list(others or [])
         return [
             {"label": self._menu_model_label(model)[:40], "value": model}
-            for model in model_ids[:MENU_MODEL_LIMIT]
+            for model in model_ids[:max(1, cap)]
         ]
 
     def _menu_session_db(self) -> Any:
