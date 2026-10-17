@@ -72,11 +72,14 @@ _LARK_SDK_IMPORTS = (
     ("lark_oapi.core", ("AccessTokenType", "HttpMethod")),
     ("lark_oapi.core.const", ("FEISHU_DOMAIN", "LARK_DOMAIN")),
     ("lark_oapi.core.model", ("BaseRequest",)),
-    ("lark_oapi.event.callback.model.p2_card_action_trigger", ("CallBackCard", "P2CardActionTriggerResponse")),
+    ("lark_oapi.event.callback.model.p2_card_action_trigger", ("CallBackCard", "CallBackToast", "P2CardActionTriggerResponse")),
     ("lark_oapi.event.dispatcher_handler", ("EventDispatcherHandler",)),
 )
 lark = FeishuWSClient = None  # type: ignore[assignment]
 globals().update({name: None for _, names in _LARK_SDK_IMPORTS for name in names})
+# Bound for real by _load_lark_oapi() at connect time; re-declared so type checkers
+# see the lazily injected names.
+CallBackCard = CallBackToast = P2CardActionTriggerResponse = None  # type: ignore[assignment]
 FEISHU_AVAILABLE = False
 _lark_import_lock = threading.Lock()
 
@@ -104,6 +107,8 @@ from gateway.platforms._shared import (
 from plugins.platforms.feishu.streaming import FeishuStreamMixin
 from plugins.platforms.feishu.step_card_lane import FeishuStepCardMixin
 from plugins.platforms.feishu.thinking_process import FeishuThinkingProcessMixin
+from plugins.platforms.feishu.slash_panel import FeishuSlashPanelMixin
+from plugins.platforms.feishu.menu_card import MENU_ACTION_KEY, FeishuMenuMixin
 
 
 logger = logging.getLogger(__name__)
@@ -333,6 +338,10 @@ class FeishuAdapterSettings:
     # 任务过程 step card (dsh-im port): process blocks in a single blue card, sealed with
     # 过程详情 on turn close. Off by default — the streaming answer card is the main lane.
     step_cards_enabled: bool = False
+    # Native "/" command panel in the Feishu input box, registered via the OpenAPI.
+    # Off by default: it needs the application:app_slash_command:{read,write} tenant
+    # scopes, and without them every sync fails with a permission error.
+    slash_panel_enabled: bool = False
 
 
 @dataclass
@@ -1269,6 +1278,15 @@ def _build_lark_client(app_id: str, app_secret: str, sdk_domain: Any) -> Any:
     return lark.Client.builder().app_id(app_id).app_secret(app_secret).domain(sdk_domain).log_level(lark.LogLevel.WARNING).build()
 
 
+def _is_menu_command(text: str) -> bool:
+    """Whether the text is exactly the ``/menu`` command (no arguments).
+
+    A strict match keeps ``/menu`` out of the dispatcher's way without
+    swallowing lookalikes such as ``/menuitem``.
+    """
+    return (text or "").strip().lower() == "/menu"
+
+
 def _card_button(label: str, btn_type: str, value: dict[str, Any]) -> dict[str, Any]:
     return {"tag": "button", "text": {"tag": "plain_text", "content": label}, "type": btn_type, "value": value}
 
@@ -1295,7 +1313,14 @@ def _sdk_build(request_cls: Any, **fields: Any) -> Any:
     return builder.build()
 
 
-class FeishuAdapter(FeishuStreamMixin, FeishuStepCardMixin, FeishuThinkingProcessMixin, BasePlatformAdapter):
+class FeishuAdapter(
+    FeishuStreamMixin,
+    FeishuStepCardMixin,
+    FeishuThinkingProcessMixin,
+    FeishuSlashPanelMixin,
+    FeishuMenuMixin,
+    BasePlatformAdapter,
+):
     """Feishu/Lark bot adapter."""
     # Answers /p/<profile>/... on the default listener for a served secondary (shared_ingress).
     serves_profile_prefix: bool = True
@@ -1358,6 +1383,8 @@ class FeishuAdapter(FeishuStreamMixin, FeishuStepCardMixin, FeishuThinkingProces
         self._approval_counter = itertools.count(1)
         self._update_prompt_state: dict[int, dict[str, str]] = {}
         self._update_prompt_counter = itertools.count(1)
+        # `/menu` card tracking: chat_id → {ids: [message_id...], served_at}
+        self._init_menu_cards()
         # Reaction deletion needs the opaque reaction_id from create, cached per message_id.
         self._pending_processing_reactions: OrderedDict[str, str] = OrderedDict()
         self._load_seen_message_ids()
@@ -1443,6 +1470,7 @@ class FeishuAdapter(FeishuStreamMixin, FeishuStepCardMixin, FeishuThinkingProces
             thinking_process=_flag("thinking_process", "FEISHU_THINKING_PROCESS", True),
             thinking_process_hidden=_flag("thinking_process_hidden", "FEISHU_THINKING_PROCESS_HIDDEN", False),
             step_cards_enabled=_flag("step_cards_enabled", "FEISHU_STEP_CARDS", False),
+            slash_panel_enabled=_flag("slash_panel_enabled", "FEISHU_SLASH_PANEL", False),
         )
 
     def _apply_settings(self, settings: FeishuAdapterSettings) -> None:
@@ -1561,6 +1589,11 @@ class FeishuAdapter(FeishuStreamMixin, FeishuStepCardMixin, FeishuThinkingProces
             logger.info("[Feishu] Connected in %s mode (%s)", self._connection_mode, self._domain_name)
             # Plugin-registered native handlers (lark_oapi client).
             self._wire_plugin_handlers(self._client)
+            # Native "/" panel: create whatever the catalog is missing. Fire-and-forget so a
+            # slow OpenAPI round-trip never delays the connection becoming usable; it is
+            # idempotent, so the next gateway start converges anything this run missed.
+            if self._slash_panel_active():
+                asyncio.ensure_future(self._sync_slash_panel_safely())
             return True
         except Exception as exc:
             await self._release_app_lock()
@@ -2235,6 +2268,8 @@ class FeishuAdapter(FeishuStreamMixin, FeishuStepCardMixin, FeishuThinkingProces
                 return self._handle_approval_card_action(event=event, action_value=action_value, loop=loop)
             if action_value.get("hermes_update_prompt_action"):
                 return self._handle_update_prompt_card_action(event=event, action_value=action_value, loop=loop)
+            if action_value.get(MENU_ACTION_KEY):
+                return self.handle_menu_card_action(event=event, action_value=action_value, loop=loop)
         self._submit_on_loop(loop, self._handle_card_action_event(data))
         return self._card_response()
 
@@ -2266,11 +2301,20 @@ class FeishuAdapter(FeishuStreamMixin, FeishuStepCardMixin, FeishuThinkingProces
         return "*" in allowed_ids or normalized in allowed_ids
 
     @staticmethod
-    def _card_response(card_data: Optional[dict[str, Any]] = None) -> Any:
-        """Synchronous card-callback response; ``card_data`` updates the card inline."""
+    def _card_response(card_data: Optional[dict[str, Any]] = None, toast: Optional[str] = None) -> Any:
+        """Synchronous card-callback response; ``card_data`` updates the card inline.
+
+        ``toast`` surfaces a short message in the client, so a rejected click says
+        why instead of looking like a dead button.
+        """
         if P2CardActionTriggerResponse is None:
             return None
         response = P2CardActionTriggerResponse()
+        if toast and CallBackToast is not None:
+            toast_obj = CallBackToast()
+            toast_obj.type = "error" if toast.startswith("!") else "info"
+            toast_obj.content = toast.lstrip("!")
+            response.toast = toast_obj
         if card_data is not None and CallBackCard is not None:
             card = CallBackCard()
             card.type = "raw"
@@ -2703,6 +2747,16 @@ class FeishuAdapter(FeishuStreamMixin, FeishuStepCardMixin, FeishuThinkingProces
 
     async def _dispatch_inbound_event(self, event: MessageEvent) -> None:
         """Apply Feishu-specific burst protection before entering the base adapter."""
+        if event.message_type == MessageType.COMMAND and _is_menu_command(event.text):
+            # Adapter-local: the menu is a Feishu card, not a gateway command.
+            # Handled here so it never reaches the command dispatcher, which
+            # would have nothing to run for it.
+            await self.send_menu_card(
+                event.source.chat_id,
+                user_id=str(getattr(event.source, "user_id", "") or ""),
+                chat_type=str(getattr(event.source, "chat_type", "") or "dm"),
+            )
+            return
         if event.message_type == MessageType.TEXT and not event.is_command():
             await self._enqueue_text_event(event)
             return
