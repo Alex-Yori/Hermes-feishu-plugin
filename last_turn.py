@@ -56,13 +56,14 @@ def _normalize_content(content: Any) -> str:
     return str(content).strip()
 
 
-def extract_last_turn(messages: list[dict[str, Any]]) -> Optional[tuple[str, list[str]]]:
-    """The last user message and the assistant texts that answered it.
+def extract_last_turn(messages: list[dict[str, Any]]) -> Optional[tuple[str, Optional[str]]]:
+    """The last user message and the FINAL assistant answer for it.
 
-    Returns ``(user_text, assistant_texts)`` where ``assistant_texts`` may be
-    empty (the round is still pending), or ``None`` when there is no user
-    message at all. Tool/tool-call rows are skipped: a *round* is what a human
-    sees — their question and the prose answers, not the machinery between.
+    Returns ``(user_text, final_answer)`` where ``final_answer`` is ``None``
+    while the round is still pending, or ``None`` overall when there is no
+    user message at all. Only the *last* assistant prose in the round is kept:
+    intermediate narrations between tool calls ("working on it…") and any
+    thinking/tool rows are process, not the answer a human would want back.
     """
     if not messages:
         return None
@@ -77,7 +78,7 @@ def extract_last_turn(messages: list[dict[str, Any]]) -> Optional[tuple[str, lis
     if last_user_index is None:
         return None
     user_text = _normalize_content(messages[last_user_index].get("content"))
-    assistant_texts: list[str] = []
+    final_answer: Optional[str] = None
     for msg in messages[last_user_index + 1:]:
         if not isinstance(msg, dict):
             continue
@@ -87,8 +88,8 @@ def extract_last_turn(messages: list[dict[str, Any]]) -> Optional[tuple[str, lis
         if role == "assistant":
             text = _normalize_content(msg.get("content"))
             if text:
-                assistant_texts.append(text)
-    return user_text, assistant_texts
+                final_answer = text  # keep overwriting: the last one wins
+    return user_text, final_answer
 
 
 def _truncate_part(text: str, limit: int) -> str:
@@ -99,17 +100,16 @@ def _truncate_part(text: str, limit: int) -> str:
 
 def render_last_turn(
     user_text: str,
-    assistant_texts: list[str],
+    final_answer: Optional[str],
     *,
     char_limit: int = PART_CHAR_LIMIT,
 ) -> str:
-    """Format one round for display: the question, then every answer part."""
+    """Format one round for display: the question, then the final answer."""
     lines = ["🙋 你：", _truncate_part(user_text, char_limit)]
-    for i, text in enumerate(assistant_texts):
-        lines += [f"🤖 我{' ' + str(i + 1) if len(assistant_texts) > 1 else ''}：",
-                  _truncate_part(text, char_limit)]
-    if not assistant_texts:
+    if final_answer is None:
         lines.append("🤖 我：（还没有回复——这一轮可能正在进行中）")
+    else:
+        lines += ["🤖 我：", _truncate_part(final_answer, char_limit)]
     return "\n\n".join(lines)
 
 
@@ -146,7 +146,7 @@ class FeishuLastTurnMixin:
         if turn is None:
             await sent(chat_id, "这个会话里还没有对话内容。")
             return
-        user_text, assistant_texts = turn
+        user_text, final_answer = turn
         reply_to = getattr(event, "message_id", None)
-        await sent(chat_id, render_last_turn(user_text, assistant_texts),
+        await sent(chat_id, render_last_turn(user_text, final_answer),
                    reply_to=reply_to if reply_to else None)
