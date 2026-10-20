@@ -109,6 +109,7 @@ from plugins.platforms.feishu.step_card_lane import FeishuStepCardMixin
 from plugins.platforms.feishu.thinking_process import FeishuThinkingProcessMixin
 from plugins.platforms.feishu.slash_panel import FeishuSlashPanelMixin
 from plugins.platforms.feishu.menu_card import MENU_ACTION_KEY, FeishuMenuMixin
+from plugins.platforms.feishu.last_turn import FeishuLastTurnMixin, is_last_turn_command
 
 
 logger = logging.getLogger(__name__)
@@ -1319,6 +1320,7 @@ class FeishuAdapter(
     FeishuThinkingProcessMixin,
     FeishuSlashPanelMixin,
     FeishuMenuMixin,
+    FeishuLastTurnMixin,
     BasePlatformAdapter,
 ):
     """Feishu/Lark bot adapter."""
@@ -2756,6 +2758,12 @@ class FeishuAdapter(
                 user_id=str(getattr(event.source, "user_id", "") or ""),
                 chat_type=str(getattr(event.source, "chat_type", "") or "dm"),
             )
+            return
+        if event.message_type == MessageType.COMMAND and is_last_turn_command(event.text):
+            # Adapter-local: a read-only view of this lane's own transcript. The
+            # gateway has no such command (``/history`` there is terminal
+            # history), so it is served here exactly like ``/menu``.
+            await self.handle_last_turn(event)
             return
         if event.message_type == MessageType.TEXT and not event.is_command():
             await self._enqueue_text_event(event)
