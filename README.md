@@ -16,12 +16,14 @@ Hermes Agent 飞书平台插件 — 流式卡片、任务过程（step card）�
 `/menu` 卡片的两个下拉读的是你自己的数据，不是预置清单：
 
 - **会话**取自会话数据库（`query_session_listing`，与 `/sessions` 同一 helper），因此包含桌面端会话；选中后走 `/resume` 把当前飞书聊天绑定过去
-- **模型**取自会话记录里**实际用过的模型**（按最近使用排序，当前模型置顶），不是 API 的全量目录；本地 GGUF 路径会被排除。想加一个还没用过的模型，在平台配置里钉住它：
+- **模型**取自**会话记录里实际用过的模型**（`sessions.model` 列，按最近使用排序，当前模型置顶），不是 `providers.<name>.models` 的全量目录——那个目录动辄几十上百个，大部分你从没用过。本地 GGUF 文件路径会被过滤掉
+
+短名单默认 3 个。想固定加入某个还没用过的模型，在平台配置里钉住它（钉住的不占短名单名额）：
 
 ```yaml
 platforms:
   feishu:
-    menu_models: ["cn:step-5-preview"]   # 钉住的模型额外列出，不占短名单名额
+    menu_models: ["cn:step-5-preview"]
 ```
 
 跨端会话受 Hermes 既有的 slash 权限门控保护，需要在平台配置里显式把自己列为 admin：
@@ -49,9 +51,10 @@ platforms:
 | `slash_panel.py` | 飞书原生 `/` 命令面板（从 `COMMAND_REGISTRY` 动态同步） |
 | `menu_card.py` | `/menu` 助手中心卡片：会话 / 模型下拉、任务控制 |
 | `plugin.yaml` | 插件元数据 |
-| `BACKLOG.md` | 尚未移植的 dsh-im 功能（待加入区） |
 
 ## 安装
+
+前置条件：已安装 Hermes Agent，且 `FEISHU_APP_ID` / `FEISHU_APP_SECRET` 已在 `.env` 中配好。
 
 将本目录复制到 Hermes Agent 的 `plugins/platforms/feishu/` 下，重启网关即可。
 
@@ -78,3 +81,7 @@ cd hermes-agent
 .venv/bin/python -m pytest tests/gateway/test_feishu_menu_card.py tests/gateway/test_feishu_slash_panel.py -q
 # 119 passed
 ```
+
+## 待加入
+
+见 [`BACKLOG.md`](BACKLOG.md)：`/watch`（关注会话，完成后主动推送）、群消息权限（mention/all 模式）、`/repair`（增量补全权限与卡片回调）。
