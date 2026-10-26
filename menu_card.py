@@ -24,6 +24,7 @@ than shipped as dead controls; every row here forwards to a real command:
     🆕 新会话   -> /new        📋 会话列表 -> /sessions
     ⏹ 停止      -> /stop       📐 压缩     -> /compress
     🧠 切换模型 -> /model
+    🧠 推理等级 -> /reasoning <level>
     📊 状态     -> /status     📖 帮助     -> /help
 
 Forwarding (rather than calling the session layer directly) is the point: the
@@ -77,6 +78,22 @@ MENU_ACTIONS: dict[str, str] = {
 MENU_SELECTS: dict[str, str] = {
     "menu_session": "/resume {option}",
     "menu_model": "/model {option}",
+    "menu_reasoning": "/reasoning {option}",
+}
+
+#: The reasoning-effort levels the menu offers, as ``level -> label``.
+#:
+#: Hermes accepts seven (``minimal``…``ultra``, plus ``none``); the card exposes
+#: the three a reader reasons about directly — 想快 / 平衡 / 想深. The rest stay
+#: reachable by typing ``/reasoning xhigh``; a dropdown of seven tiers is a
+#: dial, not a choice. Insertion order is the display order (low first).
+#:
+#: A pick forwards as ``/reasoning <level>``, which the gateway applies to THIS
+#: session (``--global`` persists it, and a card cannot ask for that).
+MENU_REASONING_LEVELS: dict[str, str] = {
+    "low": "低",
+    "medium": "中",
+    "high": "高",
 }
 
 #: How many entries a dropdown may carry. Feishu truncates long menus badly and
@@ -209,6 +226,44 @@ def _is_local_model_path(model_id: str) -> bool:
     return text.lower().endswith((".gguf", ".safetensors", ".bin", ".pt"))
 
 
+def menu_reasoning_options(current: str = "") -> list[dict[str, str]]:
+    """The three effort levels, the current one checked so the card shows state.
+
+    ``current`` is a raw Hermes level. One outside this list (``xhigh``, ``none``)
+    checks nothing rather than standing in for a neighbour: a card that marks 高
+    while the session runs ``xhigh`` tells the user something untrue.
+    """
+    level = str(current or "").strip().lower()
+    return [
+        {"label": f"✓ {label}" if level == name else label, "value": name}
+        for name, label in MENU_REASONING_LEVELS.items()
+    ]
+
+
+def menu_reasoning_index(current: str = "") -> int:
+    """``initial_index`` for the effort dropdown: the current level, or 0.
+
+    0 shows the placeholder instead of preselecting. That is the honest display
+    when the level is unset or outside the three offered — preselecting 低 would
+    read as "this is what I'm running".
+    """
+    level = str(current or "").strip().lower()
+    names = list(MENU_REASONING_LEVELS)
+    return names.index(level) + 1 if level in names else 0
+
+
+def menu_reasoning_label(current: str = "") -> str:
+    """How to name the current level in the card header.
+
+    An unconfigured session says 默认 (the route decides), and a level beyond the
+    three offered keeps its own name so the header never mislabels it.
+    """
+    level = str(current or "").strip().lower()
+    if not level:
+        return "默认"
+    return MENU_REASONING_LEVELS.get(level, level)
+
+
 def _plain_text(content: str) -> dict[str, Any]:
     return {"tag": "plain_text", "content": content}
 
@@ -240,17 +295,21 @@ def _section(title: str) -> dict[str, Any]:
     return {"tag": "markdown", "content": f"**{title}**"}
 
 
-def _select(name: str, placeholder: str, options: list[dict[str, str]]) -> dict[str, Any]:
+def _select(
+    name: str, placeholder: str, options: list[dict[str, str]], *, initial_index: int = 1,
+) -> dict[str, Any]:
     """A 2.0 single-select dropdown.
 
     Schema 2.0 rejects a ``selected`` field on options (230099 parse error);
     ``initial_index`` (1-based) is the supported way to show a current value.
+    ``0`` shows the placeholder instead — the right answer when there is no
+    current value to show, since a wrong preselect reads as a state report.
     """
     return {
         "tag": "select_static",
         "name": name,
         "placeholder": _plain_text(placeholder),
-        "initial_index": 1 if options else 0,
+        "initial_index": initial_index if options else 0,
         # The value carries the select's own name so a callback identifies its
         # source even when Feishu drops ``action.name`` (it does for some 2.0
         # select payloads), which would otherwise look like a dead card.
@@ -271,6 +330,7 @@ def build_menu_card(
     note: str = "",
     sessions: Optional[list[dict[str, str]]] = None,
     models: Optional[list[dict[str, str]]] = None,
+    reasoning_current: str = "",
 ) -> dict[str, Any]:
     """The ``/menu`` card: session + model pickers, task control, system actions.
 
@@ -278,6 +338,10 @@ def build_menu_card(
     back empty the matching dropdown is replaced by its button, which still
     reaches the same data through the command dispatcher — dsh-im's own
     fallback, and better than rendering a dropdown with nothing in it.
+
+    ``reasoning_current`` is the level the session resolves to today; it only
+    decorates the effort dropdown (a check mark and the header), never its
+    options, because the three levels are offered whatever the current one is.
     """
     elements: list[dict[str, Any]] = []
 
@@ -296,6 +360,16 @@ def build_menu_card(
         elements.append(_select("menu_model", "切换模型", model_options))
     else:
         elements.append(_button_row(_menu_button("model", "🧠 切换模型")))
+
+    # The effort picker needs no data source: the levels are Hermes' own, so it
+    # always renders. It sits with the model picker because both configure the
+    # same thing, and a pick lands on ``/reasoning`` for THIS session.
+    elements.append({"tag": "hr"})
+    elements.append(_section(f"🧠 推理等级 · 当前 {menu_reasoning_label(reasoning_current)}"))
+    elements.append(_select(
+        "menu_reasoning", "选择推理等级", menu_reasoning_options(reasoning_current),
+        initial_index=menu_reasoning_index(reasoning_current),
+    ))
 
     elements.append({"tag": "hr"})
     elements.append(_section("任务控制"))
@@ -554,6 +628,41 @@ class FeishuMenuMixin:
                 return f"{provider.get('name') or slug} · {model_id}"
         return model_id
 
+    def _menu_current_reasoning_level(self, model: str = "") -> str:
+        """The configured effort level, through Hermes' own resolver.
+
+        Mirrors the gateway's ``_load_reasoning_config``: per-model
+        ``agent.reasoning_overrides`` first, then global ``agent.reasoning_effort``,
+        keyed on the model the session would run — so the card agrees with what
+        ``/reasoning`` reports for the same session.
+
+        A session-scoped ``/reasoning`` pick lives in gateway memory the adapter
+        cannot read, so the card states the CONFIGURED level. That is the level a
+        fresh session starts at, and the header labels it 当前 rather than
+        claiming to know a live override.
+
+        Returns ``"none"`` when reasoning is switched off (YAML ``false``), and
+        ``""`` when nothing is configured — the card then says 默认 instead of
+        inventing a level.
+        """
+        if not model:
+            model = self._menu_current_model()
+        try:
+            from hermes_cli.config import load_config_readonly
+            from hermes_constants import resolve_reasoning_config
+
+            resolved = resolve_reasoning_config(load_config_readonly() or {}, model)
+        except Exception as exc:
+            logger.info(
+                "[Feishu] menu: reasoning level unavailable (%s: %s)", type(exc).__name__, exc,
+            )
+            return ""
+        if not isinstance(resolved, dict):
+            return ""
+        if resolved.get("enabled") is False:
+            return "none"
+        return str(resolved.get("effort") or "").strip().lower()
+
     async def _build_menu_card(
         self, chat_id: str, *, note: str = "", user_id: str = "", chat_type: str = "dm",
     ) -> dict[str, Any]:
@@ -561,6 +670,7 @@ class FeishuMenuMixin:
             note=note,
             sessions=await self._menu_session_options(chat_id, user_id=user_id, chat_type=chat_type),
             models=await self._menu_model_options(),
+            reasoning_current=self._menu_current_reasoning_level(),
         )
 
     # --- serving ---

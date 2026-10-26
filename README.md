@@ -9,12 +9,12 @@ Hermes Agent 飞书平台插件 — 流式卡片、任务过程（step card）�
 - **思维链通道**：原生思维链事件渲染
 - **线程回复**：step 卡以 `replyTo` 形式发成用户消息的线程回复
 - **原生命令面板**：在飞书输入框打 `/` 直接选命令，命令清单随 `COMMAND_REGISTRY` 自动同步
-- **助手中心卡片**：`/menu` 弹出一张卡片，可切换会话（跨端续接桌面端未聊完的对话）和模型
+- **助手中心卡片**：`/menu` 弹出一张卡片，可切换会话（跨端续接桌面端未聊完的对话）、模型，以及模型推理等级
 - **上一轮对话**：`/lastturn` 只显示最近一轮——你最后的问题 + 助手的**最终答案**（不含思考过程和工具调用），只读、不干扰进行中的回合
 
-## 会话与模型下拉
+## 下拉菜单的来源
 
-`/menu` 卡片的两个下拉读的是你自己的数据，不是预置清单：
+`/menu` 卡片有三个下拉。会话与模型这两个读的是你自己的数据，不是预置清单：
 
 - **会话**取自会话数据库（`query_session_listing`，与 `/sessions` 同一 helper），因此包含桌面端会话；选中后走 `/resume` 把当前飞书聊天绑定过去
 - **模型**取自**会话记录里实际用过的模型**（`sessions.model` 列，按最近使用排序，当前模型置顶），不是 `providers.<name>.models` 的全量目录——那个目录动辄几十上百个，大部分你从没用过。本地 GGUF 文件路径会被过滤掉
@@ -35,6 +35,14 @@ platforms:
     allow_admin_from: ["ou_你的open_id"]   # DM scope
     group_allow_admin_from: ["ou_xxx"]    # 群 scope（admin 名单不跨 scope）
 ```
+
+### 推理等级（低 / 中 / 高）
+
+第三个下拉不需要数据源，档位就是 Hermes 自己的；选中后走 `/reasoning <level>`。
+
+卡片标题行显示当前等级，取值走 Hermes 同一个 resolver（`agent.reasoning_overrides.<model>` 优先，其次全局 `agent.reasoning_effort`）。会话级的 `/reasoning` 覆盖存在网关内存里，适配器读不到，所以卡片报的是**配置值**。当前档位落在三档之外时（如 `xhigh`、`none`）标题照实写档位名，下拉不做预选中，也不会把 `xhigh` 冒充成「高」。
+
+点选只对**当前会话**生效——`/reasoning` 不带 `--global` 就是会话级，卡片不做这个询问。要写进 config.yaml 当全局默认档，直接输入 `/reasoning high --global`。
 
 ## 文件结构
 
@@ -82,7 +90,7 @@ cd hermes-agent
 .venv/bin/python -m pytest tests/gateway/test_feishu_step_card.py tests/gateway/test_feishu_streaming_cards.py -q
 # 56 passed
 .venv/bin/python -m pytest tests/gateway/test_feishu_menu_card.py tests/gateway/test_feishu_slash_panel.py tests/gateway/test_feishu_last_turn.py -q
-# 144 passed
+# 159 passed
 ```
 
 ## 待加入
